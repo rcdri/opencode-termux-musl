@@ -83,10 +83,13 @@ fi
 
 # --- dependencies ------------------------------------------------------------
 # clang builds the DNS shim, python runs the proxy, patchelf retargets the ELF
-# interpreter. Everything is from the standard Termux repos.
+# interpreter. libc++ is listed explicitly: Termux builds patchelf against the
+# newest libc++, and on a system whose libc++_shared.so is stale, patchelf
+# dies at startup with "CANNOT LINK EXECUTABLE". Everything is from the
+# standard Termux repos.
 
-log "Installing dependencies (curl tar patchelf clang python ca-certificates)..."
-pkg install -y curl tar patchelf clang python ca-certificates \
+log "Installing dependencies (curl tar patchelf clang python ca-certificates libc++)..."
+pkg install -y curl tar patchelf clang python ca-certificates libc++ \
   || die "Failed to install dependencies via pkg."
 
 command -v curl      >/dev/null 2>&1 || die "curl is required."
@@ -94,6 +97,13 @@ command -v tar       >/dev/null 2>&1 || die "tar is required."
 command -v patchelf  >/dev/null 2>&1 || die "patchelf is required."
 command -v clang     >/dev/null 2>&1 || die "clang is required."
 command -v python3   >/dev/null 2>&1 || die "python is required (provides python3)."
+
+# patchelf is dynamically linked against libc++_shared.so; if the installed
+# libc++ is older than the one patchelf was built with, it dies at startup
+# with "CANNOT LINK EXECUTABLE ... cannot locate symbol". Smoke-test it here
+# so the failure surfaces with an actionable message, not mid-install.
+patchelf --version >/dev/null 2>&1 \
+  || die "patchelf is installed but cannot start, likely a stale libc++ package; run 'pkg upgrade' and re-run this script."
 
 # --- work directory ----------------------------------------------------------
 
