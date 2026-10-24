@@ -1,9 +1,12 @@
 #!/bin/sh
-# install-opencode-termux.sh — install the official opencode musl ARM64 build on Termux/Android
+# install-opencode-termux.sh — install the official opencode 2 musl ARM64 build on Termux/Android
 #
-# Why this isn't just "download the musl tarball":
-# opencode's linux-arm64-musl binary is musl-linked, but Termux is bionic-based:
-#   1. its ELF interpreter (/lib/ld-musl-aarch64.so.1) doesn't exist in Termux
+# Why this isn't just "curl -fsSL https://opencode.ai/v2/install | bash":
+# The official V2 installer works great on desktop Linux, but on Termux it
+# detects neither /etc/alpine-release nor a musl ldd, so it picks the glibc
+# build (which can't run here at all). And even with the right musl tarball,
+# Termux is bionic-based, so:
+#   1. the binary's ELF interpreter (/lib/ld-musl-aarch64.so.1) doesn't exist in Termux
 #   2. musl's resolver reads /etc/resolv.conf and sends raw UDP DNS queries,
 #      which Android's firewall blocks (DNS must go through netd)
 #   3. Bun's io_uring-based networking does not work on Android
@@ -11,7 +14,8 @@
 # So this script:
 #   1. installs the musl loader + musl-built libstdc++/libgcc_s (extracted from
 #      Alpine .apk packages) into $PREFIX/lib
-#   2. downloads the official opencode-linux-arm64-musl.tar.gz release
+#   2. downloads the official opencode 2 musl build — the same npm tarball the
+#      official V2 installer uses (@opencode/cli-linux-arm64-musl)
 #   3. patches the binary's interpreter with patchelf
 #   4. builds a tiny LD_PRELOAD shim that forwards DNS to bionic's getaddrinfo
 #   5. installs a localhost HTTP proxy and routes opencode's traffic through it
@@ -21,12 +25,13 @@
 #   curl -fsSL <url-of-this-script> | sh
 # or, saved locally:
 #   ./install-opencode-termux.sh              # latest release
-#   ./install-opencode-termux.sh v1.18.33    # pinned release
+#   ./install-opencode-termux.sh 2.1.4        # pinned release
 #   ./install-opencode-termux.sh --uninstall
 #
 # Environment overrides:
-#   OPENCODE_VERSION=v1.x.y      pin a release tag (default: latest)
-#   OPENCODE_TARBALL_PATH=file   use a pre-downloaded tarball (offline install)
+#   OPENCODE_VERSION=2.x.y        pin a release (default: latest, resolved from
+#                                 https://opencode.ai/update/api/latest/cli/npm)
+#   OPENCODE_TARBALL_PATH=file    use a pre-downloaded cli-...tgz (offline install)
 #   INSTALL_NAME=opencode        wrapper name in $PREFIX/bin
 #
 # Requires: Termux (F-Droid build recommended) on an aarch64 device.
@@ -35,7 +40,9 @@
 set -e
 
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
-REPO="${REPO:-anomalyco/opencode}"
+UPDATE_API="${UPDATE_API:-https://opencode.ai/update/api/latest/cli/npm}"
+NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmjs.org}"
+TARGET="linux-arm64-musl"
 INSTALL_NAME="${INSTALL_NAME:-opencode}"
 LIBEXECDIR="$PREFIX/libexec/opencode"
 PROXY_PORT=8080
@@ -112,23 +119,54 @@ mkdir -p "$WORK"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
-# --- resolve the opencode release --------------------------------------------
+# --- resolve the opencode version --------------------------------------------
+# OpenCode 2 ships as npm packages (@opencode/cli-<target>); the update API
+# reports the latest version and which scope (@opencode, or the legacy
+# @opencode-ai for older releases) carries it.
 
 if [ "$OPENCODE_VERSION" = "latest" ]; then
   log "Resolving latest opencode release..."
-  OPENCODE_VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')"
+  METADATA="$(curl -fsSL "$UPDATE_API")" \
+    || die "Could not reach the opencode update API. Try pinning: ./install-opencode-termux.sh 2.1.4"
+  OPENCODE_VERSION="$(printf '%s' "$METADATA" | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p')"
+  PACKAGE_SCOPE="$(printf '%s' "$METADATA" | sed -n 's/.*"package": *"\([^"]*\)".*/\1/p')"
+  PACKAGE_SCOPE="${PACKAGE_SCOPE%/cli}"
   [ -n "$OPENCODE_VERSION" ] \
-    || die "Could not resolve the latest version (GitHub API). Try: ./install-opencode-termux.sh v1.18.33"
+    || die "Could not parse the latest version from the update API. Try pinning: ./install-opencode-termux.sh 2.1.4"
+  [ -n "$PACKAGE_SCOPE" ] || PACKAGE_SCOPE="@opencode"
 else
-  case "$OPENCODE_VERSION" in v*) ;; *) OPENCODE_VERSION="v$OPENCODE_VERSION" ;; esac
+  case "$OPENCODE_VERSION" in v*) OPENCODE_VERSION="${OPENCODE_VERSION#v}" ;; esac
+  PACKAGE_SCOPE="@opencode"
 fi
 log "Installing opencode $OPENCODE_VERSION"
 
-# --- download the official musl tarball --------------------------------------
+# --- pick the npm scope that carries this version ----------------------------
+# Recent releases live under @opencode; older ones under @opencode-ai. Probe
+# the registry to find which one has the requested version.
 
-TARBALL="opencode-linux-arm64-musl.tar.gz"
-URL="https://github.com/$REPO/releases/download/$OPENCODE_VERSION/$TARBALL"
+scope_status() {  # scope version -> prints the registry's HTTP status code
+  curl -s -o /dev/null -w '%{http_code}' \
+    "$NPM_REGISTRY/$1%2fcli-$TARGET/$2" 2>/dev/null || printf '000'
+}
+STATUS="$(scope_status "$PACKAGE_SCOPE" "$OPENCODE_VERSION")"
+if [ "$STATUS" != "200" ]; then
+  FALLBACK_STATUS="$(scope_status "@opencode-ai" "$OPENCODE_VERSION")"
+  if [ "$FALLBACK_STATUS" = "200" ]; then
+    PACKAGE_SCOPE="@opencode-ai"
+  elif [ "$STATUS" = "000" ] || [ "$FALLBACK_STATUS" = "000" ]; then
+    die "Could not reach the npm registry. Check your connection and re-run."
+  else
+    die "Version $OPENCODE_VERSION is not available for $TARGET. See: https://www.npmjs.com/package/@opencode/cli-$TARGET?activeTab=versions"
+  fi
+fi
+PACKAGE="$PACKAGE_SCOPE/cli-$TARGET"
+
+# --- download the official musl build ----------------------------------------
+# Same tarball the official V2 installer downloads: the npm package $PACKAGE,
+# which contains package/bin/opencode.
+
+TARBALL="cli-$TARGET-$OPENCODE_VERSION.tgz"
+URL="$NPM_REGISTRY/$PACKAGE/-/$TARBALL"
 
 if [ -n "$OPENCODE_TARBALL_PATH" ]; then
   [ -f "$OPENCODE_TARBALL_PATH" ] || die "OPENCODE_TARBALL_PATH=$OPENCODE_TARBALL_PATH not found."
@@ -175,8 +213,8 @@ curl -fL --progress-bar -o "$WORK/$LIBGCC_PKG"  "$ALPINE_BASE/$LIBGCC_PKG"  || d
 # --- extract -----------------------------------------------------------------
 
 log "Extracting..."
-tar -xzf "$WORK/$TARBALL" -C "$WORK" || die "Failed to extract the opencode tarball."
-[ -f "$WORK/opencode" ] || die "The tarball did not contain an 'opencode' binary."
+tar -xzf "$WORK/$TARBALL" -C "$WORK" || die "Failed to extract the opencode package."
+[ -f "$WORK/package/bin/opencode" ] || die "The package did not contain package/bin/opencode."
 
 # .apk files are concatenated gzip'd tar streams; --ignore-zeros (-i) makes
 # GNU tar read through all segments instead of stopping after the first.
@@ -523,7 +561,7 @@ chmod 755 "$LIBEXECDIR/proxy.py"
 # --- install the binary + patch its interpreter ------------------------------
 
 log "Installing opencode binary..."
-install -m 755 "$WORK/opencode" "$LIBEXECDIR/opencode-musl.bin"
+install -m 755 "$WORK/package/bin/opencode" "$LIBEXECDIR/opencode-musl.bin"
 
 log "Patching ELF interpreter..."
 patchelf --set-interpreter "$PREFIX/lib/ld-musl-aarch64.so.1" \
@@ -537,7 +575,7 @@ install -d "$PREFIX/bin"
 {
   echo "#!$PREFIX/bin/sh"
   cat <<'WRAPPER_EOF'
-# opencode wrapper — runs the official musl build inside Termux.
+# opencode wrapper — runs the official opencode 2 musl build inside Termux.
 #
 #   - clears any stale LD_PRELOAD (old glibc-only shims crash musl processes
 #     before main() even runs), then loads libresolvefix.so for DNS
