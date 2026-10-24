@@ -21,7 +21,7 @@
 #   curl -fsSL <url-of-this-script> | sh
 # or, saved locally:
 #   ./install-opencode-termux.sh              # latest release
-#   ./install-opencode-termux.sh v1.18.33    # pinned release
+#   ./install-opencode-termux.sh v1.19.4     # pinned release
 #   ./install-opencode-termux.sh --uninstall
 #
 # Environment overrides:
@@ -114,20 +114,35 @@ trap cleanup EXIT
 
 # --- resolve the opencode release --------------------------------------------
 
-if [ "$OPENCODE_VERSION" = "latest" ]; then
-  log "Resolving latest opencode release..."
-  OPENCODE_VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')"
-  [ -n "$OPENCODE_VERSION" ] \
-    || die "Could not resolve the latest version (GitHub API). Try: ./install-opencode-termux.sh v1.18.33"
+TARBALL="opencode-linux-arm64-musl.tar.gz"
+RELEASE_JSON=""
+
+if [ -n "$OPENCODE_TARBALL_PATH" ]; then
+  case "$OPENCODE_VERSION" in
+    latest) OPENCODE_VERSION="local-tarball" ;;
+    v*) ;;
+    *) OPENCODE_VERSION="v$OPENCODE_VERSION" ;;
+  esac
 else
-  case "$OPENCODE_VERSION" in v*) ;; *) OPENCODE_VERSION="v$OPENCODE_VERSION" ;; esac
+  if [ "$OPENCODE_VERSION" = "latest" ]; then
+    log "Resolving latest opencode release..."
+    RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest")" \
+      || die "Could not query the latest release metadata from GitHub."
+    OPENCODE_VERSION="$(printf '%s\n' "$RELEASE_JSON" \
+      | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')"
+    [ -n "$OPENCODE_VERSION" ] \
+      || die "Could not resolve the latest version (GitHub API). Try: ./install-opencode-termux.sh v1.19.4"
+  else
+    case "$OPENCODE_VERSION" in v*) ;; *) OPENCODE_VERSION="v$OPENCODE_VERSION" ;; esac
+    RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/tags/$OPENCODE_VERSION" 2>/dev/null || true)"
+    [ -n "$RELEASE_JSON" ] \
+      || die "Could not fetch release metadata for $OPENCODE_VERSION. Check the tag name or pass OPENCODE_TARBALL_PATH for offline install."
+  fi
 fi
 log "Installing opencode $OPENCODE_VERSION"
 
 # --- download the official musl tarball --------------------------------------
 
-TARBALL="opencode-linux-arm64-musl.tar.gz"
 URL="https://github.com/$REPO/releases/download/$OPENCODE_VERSION/$TARBALL"
 
 if [ -n "$OPENCODE_TARBALL_PATH" ]; then
@@ -135,7 +150,11 @@ if [ -n "$OPENCODE_TARBALL_PATH" ]; then
   log "Using local tarball: $OPENCODE_TARBALL_PATH"
   cp "$OPENCODE_TARBALL_PATH" "$WORK/$TARBALL"
 else
-  log "Downloading $URL (~60 MB)..."
+  if [ -n "$RELEASE_JSON" ] \
+    && ! printf '%s\n' "$RELEASE_JSON" | grep -q "\"name\": \"$TARBALL\""; then
+    die "Release $OPENCODE_VERSION does not include $TARBALL (arm64 musl artifact)."
+  fi
+  log "Downloading $URL (~75 MB)..."
   if ! curl -fL --progress-bar -o "$WORK/$TARBALL" "$URL"; then
     log "Hint: for a resumable manual download, run:"
     log "  curl -L -C - -o $TARBALL $URL"
@@ -176,7 +195,14 @@ curl -fL --progress-bar -o "$WORK/$LIBGCC_PKG"  "$ALPINE_BASE/$LIBGCC_PKG"  || d
 
 log "Extracting..."
 tar -xzf "$WORK/$TARBALL" -C "$WORK" || die "Failed to extract the opencode tarball."
-[ -f "$WORK/opencode" ] || die "The tarball did not contain an 'opencode' binary."
+OPENCODE_BIN=""
+for f in "$WORK/opencode" "$WORK"/*/opencode; do
+  [ -f "$f" ] || continue
+  OPENCODE_BIN="$f"
+  break
+done
+[ -n "$OPENCODE_BIN" ] \
+  || die "The tarball did not contain an 'opencode' binary (expected at top level or one directory deep)."
 
 # .apk files are concatenated gzip'd tar streams; --ignore-zeros (-i) makes
 # GNU tar read through all segments instead of stopping after the first.
@@ -523,7 +549,7 @@ chmod 755 "$LIBEXECDIR/proxy.py"
 # --- install the binary + patch its interpreter ------------------------------
 
 log "Installing opencode binary..."
-install -m 755 "$WORK/opencode" "$LIBEXECDIR/opencode-musl.bin"
+install -m 755 "$OPENCODE_BIN" "$LIBEXECDIR/opencode-musl.bin"
 
 log "Patching ELF interpreter..."
 patchelf --set-interpreter "$PREFIX/lib/ld-musl-aarch64.so.1" \
